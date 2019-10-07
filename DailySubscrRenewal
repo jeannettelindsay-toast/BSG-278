@@ -1,0 +1,114 @@
+/**
+ * Created by jdunphy on 11/19/17.
+ * Update on 3/15 to use contract status instead of custom status field
+ * Updated on 4/15 to factor in Validation_Check_Error__c 
+ * Updated on 10/4/19 to factor in Billing_Start_Date__c (Jlindsay)
+ */
+global class DailySubscriptionRenewal implements Database.Batchable < SObject > , Database.Stateful {
+    global Map < Id, String > errorMap {
+        get;set;
+    }
+    global Map < Id, SObject > IdToSObjectMap {
+        get;set;
+    }
+
+    global DailySubscriptionRenewal() {
+        errorMap = new Map < Id, String > ();
+        IdToSObjectMap = new Map < Id, SObject > ();
+    }
+
+    global Database.QueryLocator start(Database.BatchableContext BC) {
+        //Query all subscriptions with renewal dates today and save the contact Ids
+        return Database.getQueryLocator('SELECT Id, Name, Status from Contract WHERE Id IN (SELECT SBQQ__Contract__c from SBQQ__subscription__C where next_bill_date__c = LAST_N_DAYS:30) and Validation_Check_Error__c = Null and Account.Billing_Start_Date__c <= TODAY and Account.Billing_Start_Date__c != NULL');
+        
+    }
+
+    global void execute(Database.BatchableContext BC, List < Contract > scope) {
+        List < Contract > cntList = new List < Contract > ();
+        for (SObject s: scope) {
+            Contract cnt = (Contract) s;
+
+            //System.debug('Status :' + cnt.Status);
+
+            If(cnt.Status == 'Activated') {
+
+                cnt.Subscription_Order_Flow__c = TRUE;
+
+            }
+
+            //Force Fail For Test Class
+
+            if (cnt.Name == 'Test Contract 2') {
+
+                cnt.ContractTerm = 12345;
+
+            }
+
+
+            cntList.add(cnt);
+        }
+
+        if (cntList.size() > 0) {
+            List < Database.SaveResult > srst = Database.Update(cntList, false);
+            Integer index = 0;
+            for (Database.SaveResult dsr: srst) {
+                if (!dsr.isSuccess()) {
+                    String errMsg = dsr.getErrors()[0].getMessage();
+                    errorMap.put(cntList[index].Id, errMsg);
+                    IdToSObjectMap.put(cntList[index].Id, cntList[index]);
+                }
+                index++;
+            }
+        }
+    }
+
+    global void finish(Database.BatchableContext BC) {
+        //Send an email to the User after the batch completes
+        if (!errorMap.isEmpty()) {
+            AsyncApexJob a = [SELECT id, ApexClassId,
+                JobItemsProcessed, TotalJobItems,
+                NumberOfErrors, CreatedBy.Email
+                FROM AsyncApexJob
+                WHERE id =: BC.getJobId()
+            ];
+            String body = 'Batch job ' + 'BatchApexAccountUpdate ' + 'has finished. \n' + 'There were ' + errorMap.size() + ' errors. Please find the error list attached to the Case.';
+
+            // Creating the CSV file
+            String finalstr = 'Id, Name, Error \n';
+            String subject = 'Subscription Renewal Error Alert';
+            String attName = 'SBS_Errors.csv';
+            for (Id id: errorMap.keySet()) {
+                string err = errorMap.get(id);
+                Contract cntErr = (Contract) IdToSObjectMap.get(id);
+                string recordString = '"' + id + '","' + cntErr.name + '","' + err + '"\n';
+                finalstr = finalstr + recordString;
+            }
+
+            // Define the email
+            Messaging.SingleEmailMessage email = new Messaging.SingleEmailMessage();
+
+            // Create the email attachment
+            Messaging.EmailFileAttachment efa = new Messaging.EmailFileAttachment();
+            efa.setFileName(attName);
+            efa.setBody(Blob.valueOf(finalstr));
+
+            // Sets the paramaters of the email
+            email.setSubject(subject);
+            email.setToAddresses(new String[] {
+                'business_systems@toasttab.com'
+            });
+            email.setPlainTextBody(body);
+            email.setFileAttachments(new Messaging.EmailFileAttachment[] {
+                efa
+            });
+
+            // Sends the email
+            Messaging.SendEmailResult[] r =
+                Messaging.sendEmail(new Messaging.SingleEmailMessage[] {
+                    email
+                });
+        }
+    }
+}
+
+                  
